@@ -14,12 +14,14 @@ namespace BranchedTabs
     [ProvideAutoLoad(UIContextGuids80.SolutionExists, PackageAutoLoadFlags.BackgroundLoad)]
     public sealed class BranchedTabsPackage : AsyncPackage
     {
+        private TabManager _tabManager;
+
         protected override async Task InitializeAsync(CancellationToken cancellationToken, IProgress<ServiceProgressData> progress)
         {
             await this.JoinableTaskFactory.SwitchToMainThreadAsync(cancellationToken);
 
-            var manager = new TabManager(this);
-            await manager.InitializeAsync();
+            _tabManager = new TabManager(this);
+            await _tabManager.InitializeAsync();
         }
 
     }

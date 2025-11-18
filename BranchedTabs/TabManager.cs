@@ -20,6 +20,7 @@ namespace BranchedTabs
 
         private FileSystemWatcher _headWatcher;
         private string _currentBranch;
+        private string _gitPath;
 
         private readonly HashSet<string> _currentlyOpenFiles = new HashSet<string>();
         private DocumentEvents _documentEvents;
@@ -63,13 +64,11 @@ namespace BranchedTabs
 
         private void StartWatchingBranchChanges()
         {
-            var headPath = Path.Combine(_solutionPath, ".git", "HEAD");
-            if (!File.Exists(headPath))
-                return;
+            if (string.IsNullOrEmpty(_gitPath)) return;
 
             _headWatcher = new FileSystemWatcher();
 
-            _headWatcher.Path = Path.Combine(_solutionPath, ".git");
+            _headWatcher.Path = _gitPath;
             _headWatcher.Filter = "HEAD";
             _headWatcher.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName | NotifyFilters.Attributes;
 
@@ -120,6 +119,9 @@ namespace BranchedTabs
             _solutionPath = Path.GetDirectoryName(_dte.Solution.FullName);
             if (!IsFeatureEnabled() || string.IsNullOrEmpty(_solutionPath))
                 return;
+
+            _gitPath = FindGitDir(_solutionPath);
+            if (string.IsNullOrEmpty(_gitPath)) return;
 
             LoadState();
 
@@ -188,12 +190,40 @@ namespace BranchedTabs
 
         private string GetCurrentBranch()
         {
-            var headFile = Path.Combine(_solutionPath, ".git", "HEAD");
+            if (string.IsNullOrEmpty(_gitPath)) return null;
+
+            var headFile = Path.Combine(_gitPath, "HEAD");
             if (!File.Exists(headFile)) return null;
 
-            var content = File.ReadAllText(headFile);
-            var match = Regex.Match(content, @"ref:\srefs/heads/(.+)");
-            return match.Success ? match.Groups[1].Value.Trim() : null;
+            for (int i = 0; i < 3; i++)
+            {
+                try
+                {
+                    var content = File.ReadAllText(headFile);
+                    var match = Regex.Match(content, @"ref:\srefs/heads/(.+)");
+                    if (match.Success) return match.Groups[1].Value.Trim();
+                    
+                    // Handle detached HEAD or other states if needed, for now return null or the hash
+                    return null; 
+                }
+                catch (IOException)
+                {
+                    System.Threading.Thread.Sleep(100);
+                }
+            }
+            return null;
+        }
+
+        private string FindGitDir(string startPath)
+        {
+            var dir = new DirectoryInfo(startPath);
+            while (dir != null)
+            {
+                var gitDir = Path.Combine(dir.FullName, ".git");
+                if (Directory.Exists(gitDir)) return gitDir;
+                dir = dir.Parent;
+            }
+            return null;
         }
 
 
