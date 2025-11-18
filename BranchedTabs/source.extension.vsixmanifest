@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
     <Metadata>
-        <Identity Id="BranchedTabs.876fb8bd-c8c7-43e2-b065-fb90611188c1" Version="1.1" Language="en-US" Publisher="mike_katsoulakis" />
+        <Identity Id="BranchedTabs.876fb8bd-c8c7-43e2-b065-fb90611188c1" Version="1.2" Language="en-US" Publisher="MikeKatsoulakis" />
         <DisplayName>BranchedTabs</DisplayName>
-        <Description xml:space="preserve">Empty VSIX Project.</Description>
+        <Description xml:space="preserve">Tabs per branchTabs per branch</Description>
     </Metadata>
     <Installation>
         <InstallationTarget Id="Microsoft.VisualStudio.Community" Version="[17.0, 18.0)">
