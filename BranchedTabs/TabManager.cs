@@ -2,39 +2,38 @@
 using EnvDTE80;
 using Microsoft;
 using Microsoft.VisualStudio.Shell;
-using Newtonsoft.Json;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace BranchedTabs
 {
 
-    public class TabManager
+    internal sealed class TabManager
     {
         private readonly AsyncPackage _package;
+        private readonly GitBranchContext _gitBranchContext;
+        private readonly BranchWorkspaceStateStore _stateStore = new BranchWorkspaceStateStore();
         private DTE2 _dte;
+        private SolutionEvents _solutionEvents;
+        private WindowEvents _windowEvents;
         private string _solutionPath;
 
-        private FileSystemWatcher _headWatcher;
-        private string _currentBranch;
-        private string _gitPath;
-
-        private readonly HashSet<string> _currentlyOpenFiles = new HashSet<string>();
+        private readonly HashSet<string> _currentlyOpenFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private DocumentEvents _documentEvents;
-
-        private Dictionary<string, List<string>> _branchFileMap = new Dictionary<string, List<string>>();
-
-        private const string SaveFileName = "BranchTabs.json";
+        private bool _isRestoring;
+        private int _pendingTabRefresh;
 
         private TabManagerOptions Options =>
             (TabManagerOptions)_package.GetDialogPage(typeof(TabManagerOptions));
 
-        public TabManager(AsyncPackage package)
+        public TabManager(AsyncPackage package, GitBranchContext gitBranchContext)
         {
             _package = package;
+            _gitBranchContext = gitBranchContext;
         }
 
         public async Task InitializeAsync()
@@ -48,8 +47,18 @@ namespace BranchedTabs
             _documentEvents.DocumentOpened += OnDocumentOpened;
             _documentEvents.DocumentClosing += OnDocumentClosing;
 
-            _dte.Events.SolutionEvents.Opened += OnSolutionOpened;
-            _dte.Events.SolutionEvents.AfterClosing += OnSolutionClosed;
+            _windowEvents = _dte.Events.WindowEvents;
+            _windowEvents.WindowCreated += OnWindowCreated;
+            _windowEvents.WindowClosing += OnWindowClosing;
+
+            _solutionEvents = _dte.Events.SolutionEvents;
+            _solutionEvents.Opened += OnSolutionOpened;
+            _solutionEvents.BeforeClosing += OnSolutionClosing;
+            _solutionEvents.AfterClosing += OnSolutionClosed;
+
+            _gitBranchContext.BranchChanged += OnBranchChanged;
+
+            BranchedTabsPackage.Trace("Tab manager hooked solution and document events.");
 
             if (_dte.Solution.IsOpen)
             {
@@ -57,58 +66,75 @@ namespace BranchedTabs
             }
         }
 
-
-        /// <summary>
-        /// File System Watcher for Branch Changes
-        /// </summary>
-
-        private void StartWatchingBranchChanges()
-        {
-            if (string.IsNullOrEmpty(_gitPath)) return;
-
-            _headWatcher = new FileSystemWatcher();
-
-            _headWatcher.Path = _gitPath;
-            _headWatcher.Filter = "HEAD";
-            _headWatcher.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName | NotifyFilters.Attributes;
-
-            _headWatcher.Changed += OnHeadFileChanged;
-            _headWatcher.Renamed += OnHeadFileChanged;
-            _headWatcher.Created += OnHeadFileChanged;
-
-            _headWatcher.EnableRaisingEvents = true;
-        }
-
-        private void StopWatchingBranchChanges()
-        {
-            if (_headWatcher != null)
-            {
-                _headWatcher.EnableRaisingEvents = false;
-                _headWatcher.Dispose();
-                _headWatcher = null;
-            }
-        }
-
-
-        /// <summary>
-        /// Event Handlers
-        /// </summary>
-
         private void OnDocumentOpened(Document document)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            if (!string.IsNullOrEmpty(document?.FullName) && File.Exists(document.FullName))
+            try
             {
-                _currentlyOpenFiles.Add(document.FullName);
+                if (!string.IsNullOrEmpty(document?.FullName) && File.Exists(document.FullName))
+                {
+                    _currentlyOpenFiles.Add(document.FullName);
+                    PersistCurrentTabs();
+                }
+            }
+            catch (Exception ex)
+            {
+                BranchedTabsPackage.TraceError("Tab tracking failed while opening a document.", ex);
             }
         }
 
         private void OnDocumentClosing(Document document)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            if (!string.IsNullOrEmpty(document?.FullName))
+            try
             {
-                _currentlyOpenFiles.Remove(document.FullName);
+                if (!string.IsNullOrEmpty(document?.FullName))
+                {
+                    _currentlyOpenFiles.Remove(document.FullName);
+                }
+
+                QueueRefreshAndPersist();
+            }
+            catch (Exception ex)
+            {
+                BranchedTabsPackage.TraceError("Tab tracking failed while closing a document.", ex);
+            }
+        }
+
+        private void OnWindowCreated(Window window)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                if (TryGetWindowDocumentPath(window, out var documentPath))
+                {
+                    _currentlyOpenFiles.Add(documentPath);
+                    PersistCurrentTabs();
+                }
+            }
+            catch (Exception ex)
+            {
+                BranchedTabsPackage.TraceError("Tab tracking failed while creating a window.", ex);
+            }
+        }
+
+        private void OnWindowClosing(Window window)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                if (TryGetWindowDocumentPath(window, out var documentPath))
+                {
+                    _currentlyOpenFiles.Remove(documentPath);
+                }
+
+                QueueRefreshAndPersist();
+            }
+            catch (Exception ex)
+            {
+                BranchedTabsPackage.TraceError("Tab tracking failed while closing a window.", ex);
             }
         }
 
@@ -116,18 +142,176 @@ namespace BranchedTabs
         {
             ThreadHelper.ThrowIfNotOnUIThread();
 
-            _solutionPath = Path.GetDirectoryName(_dte.Solution.FullName);
-            if (!IsFeatureEnabled() || string.IsNullOrEmpty(_solutionPath))
+            try
+            {
+                _solutionPath = Path.GetDirectoryName(_dte.Solution.FullName);
+                _gitBranchContext.InitializeForSolution(_solutionPath);
+
+                BranchedTabsPackage.Trace($"Tab manager solution opened. Path='{_solutionPath}', Branch='{_gitBranchContext.CurrentBranch}', HasGit={_gitBranchContext.HasGitRepository}, Enabled={IsFeatureEnabled()}");
+
+                RefreshOpenFiles();
+
+                if (!IsFeatureEnabled() || string.IsNullOrEmpty(_solutionPath) || !_gitBranchContext.HasGitRepository)
+                    return;
+
+                RestoreTabsForCurrentBranch();
+                PersistCurrentTabs();
+            }
+            catch (Exception ex)
+            {
+                BranchedTabsPackage.TraceError("Tab restore failed while opening the solution.", ex);
+            }
+        }
+
+        private void OnSolutionClosing()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                PersistCurrentTabs();
+            }
+            catch (Exception ex)
+            {
+                BranchedTabsPackage.TraceError("Tab save failed while closing the solution.", ex);
+            }
+        }
+
+        private void OnSolutionClosed()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                _currentlyOpenFiles.Clear();
+                _solutionPath = null;
+            }
+            catch (Exception ex)
+            {
+                BranchedTabsPackage.TraceError("Tab manager cleanup failed after closing the solution.", ex);
+            }
+        }
+
+        private void OnBranchChanged(object sender, BranchChangedEventArgs e)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                if (!IsFeatureEnabled())
+                {
+                    return;
+                }
+
+                if (string.IsNullOrWhiteSpace(_solutionPath) || !_dte.Solution.IsOpen)
+                {
+                    return;
+                }
+
+                BranchedTabsPackage.Trace($"Tab manager branch changed from '{e?.PreviousBranch}' to '{e?.CurrentBranch}'.");
+
+                SaveTabsForBranch(e.PreviousBranch);
+                RestoreTabsForCurrentBranch();
+                PersistCurrentTabs();
+            }
+            catch (Exception ex)
+            {
+                BranchedTabsPackage.TraceError($"Tab restore failed while switching branches from '{e?.PreviousBranch}' to '{e?.CurrentBranch}'.", ex);
+            }
+        }
+
+        private bool IsFeatureEnabled()
+        {
+            return Options.EnableBranchTabs;
+        }
+
+        private void PersistCurrentTabs()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            if (_isRestoring || !IsFeatureEnabled() || string.IsNullOrWhiteSpace(_solutionPath) || !_gitBranchContext.HasGitRepository)
+            {
                 return;
+            }
 
-            _gitPath = FindGitDir(_solutionPath);
-            if (string.IsNullOrEmpty(_gitPath)) return;
+            SaveTabsForCurrentBranch();
+        }
 
-            LoadState();
+        private void QueueRefreshAndPersist()
+        {
+            if (Interlocked.Exchange(ref _pendingTabRefresh, 1) == 1)
+            {
+                return;
+            }
 
-            _currentBranch = GetCurrentBranch();
+            ThreadHelper.JoinableTaskFactory.RunAsync(async delegate
+            {
+                try
+                {
+                    await Task.Yield();
+                    await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+
+                    RefreshOpenFiles();
+                    PersistCurrentTabs();
+                }
+                catch (Exception ex)
+                {
+                    BranchedTabsPackage.TraceError("Tab tracking failed while refreshing open files.", ex);
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _pendingTabRefresh, 0);
+                }
+            });
+        }
+
+        private void SaveTabsForCurrentBranch()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            SaveTabsForBranch(_gitBranchContext.CurrentBranch);
+        }
+
+        private void SaveTabsForBranch(string branch)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            if (string.IsNullOrWhiteSpace(branch) || string.IsNullOrWhiteSpace(_solutionPath))
+            {
+                return;
+            }
+
+            var openTabs = _currentlyOpenFiles
+                .Where(File.Exists)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            BranchedTabsPackage.Trace($"Saving {openTabs.Count} tabs for branch '{branch}'.");
+            _stateStore.SaveBranch(_solutionPath, branch, branchState =>
+            {
+                branchState.OpenTabs = openTabs;
+            });
+        }
+
+        private void RefreshOpenFiles()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
 
             _currentlyOpenFiles.Clear();
+
+            foreach (Window window in _dte.Windows)
+            {
+                if (TryGetWindowDocumentPath(window, out var documentPath))
+                {
+                    _currentlyOpenFiles.Add(documentPath);
+                }
+            }
+
+            if (_currentlyOpenFiles.Count > 0)
+            {
+                return;
+            }
+
             foreach (Document doc in _dte.Documents)
             {
                 if (!string.IsNullOrWhiteSpace(doc.FullName) && File.Exists(doc.FullName))
@@ -135,185 +319,82 @@ namespace BranchedTabs
                     _currentlyOpenFiles.Add(doc.FullName);
                 }
             }
-
-            RestoreTabsForCurrentBranch();
-            StartWatchingBranchChanges();
         }
 
-        private void OnSolutionClosed()
-        {
-            var path = _solutionPath;
-            _solutionPath = null;
-
-            if (!IsFeatureEnabled() || string.IsNullOrEmpty(path))
-                return;
-
-            StopWatchingBranchChanges();
-
-            _ = Task.Run(() =>
-            {
-                ThreadHelper.JoinableTaskFactory.Run(async () =>
-                {
-                    await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
-                    SaveTabsForCurrentBranch();
-                });
-            });
-        }
-
-        private void OnHeadFileChanged(object sender, FileSystemEventArgs e)
-        {
-            ThreadHelper.JoinableTaskFactory.RunAsync(async () =>
-            {
-                await Task.Delay(200);
-                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
-
-                var newBranch = GetCurrentBranch();
-                if (newBranch != null && newBranch != _currentBranch)
-                {
-                    SaveTabsForCurrentBranch();
-                    _currentBranch = newBranch;
-                    RestoreTabsForCurrentBranch();
-                }
-            });
-        }
-
-
-        /// <summary>
-        /// Helper Methods
-        /// </summary>>
-
-        private bool IsFeatureEnabled()
-        {
-            var options = (TabManagerOptions)_package.GetDialogPage(typeof(TabManagerOptions));
-            return options.EnableBranchTabs;
-        }
-
-        private string GetCurrentBranch()
-        {
-            if (string.IsNullOrEmpty(_gitPath)) return null;
-
-            var headFile = Path.Combine(_gitPath, "HEAD");
-            if (!File.Exists(headFile)) return null;
-
-            for (int i = 0; i < 3; i++)
-            {
-                try
-                {
-                    var content = File.ReadAllText(headFile);
-                    var match = Regex.Match(content, @"ref:\srefs/heads/(.+)");
-                    if (match.Success) return match.Groups[1].Value.Trim();
-                    
-                    // Handle detached HEAD or other states if needed, for now return null or the hash
-                    return null; 
-                }
-                catch (IOException)
-                {
-                    System.Threading.Thread.Sleep(100);
-                }
-            }
-            return null;
-        }
-
-        private string FindGitDir(string startPath)
-        {
-            var dir = new DirectoryInfo(startPath);
-            while (dir != null)
-            {
-                var gitDir = Path.Combine(dir.FullName, ".git");
-                if (Directory.Exists(gitDir)) return gitDir;
-                dir = dir.Parent;
-            }
-            return null;
-        }
-
-
-        /// <summary>
-        /// Tab Management Methods
-        /// </summary>>
-
-        private void SaveTabsForCurrentBranch()
+        private static bool TryGetWindowDocumentPath(Window window, out string documentPath)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            
-            if (_currentBranch == null) return;
 
-            _branchFileMap[_currentBranch] = _currentlyOpenFiles.ToList();
+            documentPath = null;
+            if (window == null)
+            {
+                return false;
+            }
 
-            SaveState();
+            try
+            {
+                var document = window.Document;
+                if (document == null || string.IsNullOrWhiteSpace(document.FullName) || !File.Exists(document.FullName))
+                {
+                    return false;
+                }
+
+                documentPath = document.FullName;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private void RestoreTabsForCurrentBranch()
         {
             ThreadHelper.ThrowIfNotOnUIThread();
 
-            var branch = GetCurrentBranch();
-            if (branch == null || !_branchFileMap.TryGetValue(branch, out var filesToOpen))
+            var branch = _gitBranchContext.CurrentBranch;
+            var branchState = _stateStore.GetBranch(_solutionPath, branch);
+            if (string.IsNullOrWhiteSpace(branch) || branchState == null)
+            {
+                BranchedTabsPackage.Trace($"No saved tabs found for branch '{branch}'.");
                 return;
+            }
+
+            var filesToOpen = branchState.OpenTabs ?? new List<string>();
+            BranchedTabsPackage.Trace($"Restoring {filesToOpen.Count} tabs for branch '{branch}'.");
 
             var restoreMode = Options.RestoreMode;
-
-            if (restoreMode != TabRestoreMode.RestoreOnly)
+            _isRestoring = true;
+            try
             {
-                foreach (Document doc in _dte.Documents)
+                if (restoreMode != TabRestoreMode.RestoreOnly)
                 {
-                    var isUnsaved = !doc.Saved;
-
-                    switch (restoreMode)
+                    var documentsToClose = _dte.Documents.Cast<Document>().ToList();
+                    foreach (Document doc in documentsToClose)
                     {
-                        case TabRestoreMode.ReplaceAndKeepUnsaved when isUnsaved:
-                            continue;
-                        case TabRestoreMode.ReplaceAllAndSaveUnsaved when isUnsaved:
-                            doc.Save();
-                            break;
+                        var isUnsaved = !doc.Saved;
+
+                        switch (restoreMode)
+                        {
+                            case TabRestoreMode.ReplaceAndKeepUnsaved when isUnsaved:
+                                continue;
+                            case TabRestoreMode.ReplaceAllAndSaveUnsaved when isUnsaved:
+                                doc.Save();
+                                break;
+                        }
+
+                        doc.Close(vsSaveChanges.vsSaveChangesNo);
                     }
-
-                    doc.Close(vsSaveChanges.vsSaveChangesNo);
                 }
-            }
 
-            foreach (var file in filesToOpen.Where(File.Exists))
-            {
-                _dte.ItemOperations.OpenFile(file);
-            }
-        }
-
-
-        /// <summary>
-        /// Saved State Management Methods
-        /// </summary>>
-
-        private void LoadState()
-        {
-            try
-            {
-                var savePath = Path.Combine(_solutionPath, ".vs", SaveFileName);
-                if (File.Exists(savePath))
+                foreach (var file in filesToOpen.Where(File.Exists))
                 {
-                    _branchFileMap = JsonConvert.DeserializeObject<Dictionary<string, List<string>>>(File.ReadAllText(savePath))
-                                     ?? new Dictionary<string, List<string>>();
+                    _dte.ItemOperations.OpenFile(file);
                 }
             }
-            catch
+            finally
             {
-                _branchFileMap = new Dictionary<string, List<string>>();
-            }
-        }
-
-
-        private void SaveState()
-        {
-            try
-            {
-                var saveDir = Path.Combine(_solutionPath, ".vs");
-                Directory.CreateDirectory(saveDir);
-
-                var savePath = Path.Combine(saveDir, SaveFileName);
-                var json = JsonConvert.SerializeObject(_branchFileMap, Formatting.Indented);
-                File.WriteAllText(savePath, json);
-            }
-            catch
-            {
-                // Handle any exceptions silently, as this is a best-effort save operation
+                _isRestoring = false;
             }
         }
 
